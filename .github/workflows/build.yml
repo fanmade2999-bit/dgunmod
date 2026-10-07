@@ -27,7 +27,102 @@ jobs:
       - name: Install Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y apktool zipalign apksigner cmake ninja-build
+          sudo apt-get install -y apktool zipalign apksigner cmake ninja-build python3
+
+      - name: Verify Original APK
+        run: |
+          test -f original.apk
+          echo "original.apk found:"
+          ls -lh original.apk
+
+      - name: Decompile original.apk
+        run: |
+          apktool d original.apk -o game_out
+
+      - name: Inject System.loadLibrary("netmod") into Smali
+        run: |
+          python3 - <<'PY'
+          import glob
+          import re
+
+          smali_files = glob.glob("game_out/smali*/**/*.smali", recursive=True)
+          candidates = []
+
+          for f in smali_files:
+              with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                  content = fh.read()
+              if ".method" in content and (
+                  "Landroid/app/Activity;" in content
+                  or "onCreate(Landroid/os/Bundle;)V" in content
+              ):
+                  candidates.append(f)
+
+          target_file = candidates[0] if candidates else (smali_files[0] if smali_files else None)
+          if not target_file:
+              raise SystemExit("No Smali files found after apktool decompilation")
+
+          print(f"Injecting loadLibrary into: {target_file}")
+
+          with open(target_file, "r", encoding="utf-8") as fh:
+              lines = fh.readlines()
+
+          if 'System;->loadLibrary(Ljava/lang/String;)V' in ''.join(lines):
+              print("netmod loadLibrary already present; leaving file unchanged")
+              raise SystemExit(0)
+
+          # Prefer the class static initializer. If it doesn't exist, create one.
+          start = None
+          end = None
+          for i, line in enumerate(lines):
+              if re.match(r'^\.method\s+(?:public\s+|private\s+|protected\s+|static\s+|final\s+|synthetic\s+)*<clinit>\(\)V', line):
+                  start = i
+                  for j in range(i + 1, len(lines)):
+                      if lines[j].startswith(".end method"):
+                          end = j
+                          break
+                  break
+
+          if start is not None and end is not None:
+              block = lines[start:end]
+              registers_idx = next((k for k, x in enumerate(block) if x.strip().startswith(".registers ")), None)
+              locals_idx = next((k for k, x in enumerate(block) if x.strip().startswith(".locals ")), None)
+
+              if registers_idx is not None:
+                  m = re.search(r'\.registers\s+(\d+)', block[registers_idx])
+                  if m:
+                      n = int(m.group(1))
+                      block[registers_idx] = block[registers_idx].replace(str(n), str(max(n, 1)), 1)
+              elif locals_idx is not None:
+                  m = re.search(r'\.locals\s+(\d+)', block[locals_idx])
+                  if m:
+                      n = int(m.group(1))
+                      block[locals_idx] = block[locals_idx].replace(str(n), str(max(n, 1)), 1)
+
+              insert_at = len(block)
+              while insert_at > 0 and block[insert_at-1].strip() in ("", ".end method"):
+                  insert_at -= 1
+              block.insert(insert_at, '    const-string v0, "netmod"\n')
+              block.insert(insert_at + 1, '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
+              lines[start:end] = block
+          else:
+              # No <clinit>: add one before the first method.
+              first_method = next((i for i, x in enumerate(lines) if x.startswith(".method ")), len(lines))
+              init = [
+                  ".method static constructor <clinit>()V\n",
+                  "    .locals 1\n",
+                  '    const-string v0, "netmod"\n',
+                  '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n',
+                  "    return-void\n",
+                  ".end method\n",
+                  "\n"
+              ]
+              lines[first_method:first_method] = init
+
+          with open(target_file, "w", encoding="utf-8") as fh:
+              fh.writelines(lines)
+
+          print("Smali injection complete")
+          PY
 
       - name: Build Native Library (libnetmod.so)
         run: |
