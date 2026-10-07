@@ -147,7 +147,16 @@ jobs:
         run: |
           zipalign -v -f 4 patched.apk patched_aligned.apk
           keytool -genkey -v -keystore test.jks -alias test -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=Test"
-          apksigner sign --ks test.jks --ks-pass pass:123456 --out patched_signed.apk patched_aligned.apk
+          apksigner sign \
+            --ks test.jks \
+            --ks-pass pass:123456 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out patched_signed.apk \
+            patched_aligned.apk
+          echo "Verifying final APK signature..."
+          apksigner verify --verbose --print-certs patched_signed.apk
 
       - name: Upload Signed APK
         uses: actions/upload-artifact@v4
