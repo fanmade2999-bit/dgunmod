@@ -29,7 +29,15 @@ jobs:
       - name: Install Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y apktool zipalign apksigner cmake ninja-build python3
+          sudo apt-get install -y zipalign apksigner cmake ninja-build python3 curl
+          curl -L --fail --retry 3 -o /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.12.1/apktool_2.12.1.jar
+          sudo install -m 0644 /tmp/apktool.jar /usr/local/lib/apktool.jar
+          sudo tee /usr/local/bin/apktool >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          exec java -jar /usr/local/lib/apktool.jar "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
 
       - name: Verify Original APK
         run: |
@@ -72,7 +80,6 @@ jobs:
               print("netmod loadLibrary already present; leaving file unchanged")
               raise SystemExit(0)
 
-          # Prefer the class static initializer. If it doesn't exist, create one.
           start = None
           end = None
           for i, line in enumerate(lines):
@@ -107,7 +114,6 @@ jobs:
               block.insert(insert_at + 1, '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
               lines[start:end] = block
           else:
-              # No <clinit>: add one before the first method.
               first_method = next((i for i, x in enumerate(lines) if x.startswith(".method ")), len(lines))
               init = [
                   ".method static constructor <clinit>()V\n",
@@ -128,11 +134,7 @@ jobs:
 
       - name: Build Native Library (libnetmod.so)
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-24             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
       - name: Inject Shared Library & Rebuild APK
