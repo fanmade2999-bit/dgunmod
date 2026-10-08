@@ -256,8 +256,15 @@ void hk_prg_PLY(_PWORK* pw) {
     }
 
     prg_fn_t orig = g_orig_prg;
+    _PWORK* lp = local_player();
+    static bool logged_dispatch = false;
+    if (!logged_dispatch) {
+        NM_LOG("hk_prg_PLY dispatch: pw=%p local_player=%p orig=%p match=%s",
+               pw, lp, reinterpret_cast<void*>(orig), (pw == lp) ? "YES" : "NO");
+        logged_dispatch = true;
+    }
     if (!orig) return;  // should be impossible once installed; never call through null
-    if (pw != local_player()) { orig(pw); return; }
+    if (pw != lp) { orig(pw); return; }
 
     orig(pw);
 
