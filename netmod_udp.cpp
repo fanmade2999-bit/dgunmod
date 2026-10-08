@@ -61,15 +61,40 @@ void rx_loop(int fd) {
     Packet p;
     while (g_running.load()) {
         ssize_t n = recvfrom(fd, &p, sizeof(p), 0, nullptr, nullptr);
-        if (n != static_cast<ssize_t>(sizeof(p))) continue;
-        if (p.magic != kMagic || p.version != kVersion) continue;
-        if (p.sender_id == g_self_id) continue;
-        if (!sane(p.x) || !sane(p.y) || !sane(p.z) || !std::isfinite(p.angle)) continue;
+        if (n < 0) continue;  // SO_RCVTIMEO/interrupt; no packet to diagnose.
+        NM_LOG("UDP rx: len=%zd", n);
+        if (n != static_cast<ssize_t>(sizeof(p))) {
+            NM_LOG("UDP drop: invalid len %zd (expected %zu)", n, sizeof(p));
+            continue;
+        }
+        NM_LOG("UDP rx header: magic=%04x version=%u sender=%08x seq=%u",
+               p.magic, p.version, p.sender_id, p.seq);
+        if (p.magic != kMagic) {
+            NM_LOG("UDP drop: bad magic %04x (expected %04x)", p.magic, kMagic);
+            continue;
+        }
+        if (p.version != kVersion) {
+            NM_LOG("UDP drop: bad version %u (expected %u)", p.version, kVersion);
+            continue;
+        }
+        if (p.sender_id == g_self_id) {
+            NM_LOG("UDP drop: self sender %08x", p.sender_id);
+            continue;
+        }
+        if (!sane(p.x) || !sane(p.y) || !sane(p.z) || !std::isfinite(p.angle)) {
+            NM_LOG("UDP drop: invalid transform x=%g y=%g z=%g angle=%g",
+                   p.x, p.y, p.z, p.angle);
+            continue;
+        }
 
         std::lock_guard<std::mutex> lk(g_rx_mx);
         const bool newer = p.sender_id != g_rx_sender ||
                            static_cast<int32_t>(p.seq - g_rx_latest.seq) > 0;
-        if (!newer) continue;
+        if (!newer) {
+            NM_LOG("UDP drop: stale seq %u from sender %08x (latest %u)",
+                   p.seq, p.sender_id, g_rx_latest.seq);
+            continue;
+        }
         g_rx_sender = p.sender_id;
         g_rx_latest = {p.x, p.y, p.z, p.angle, p.seq};
         g_rx_new = true;
