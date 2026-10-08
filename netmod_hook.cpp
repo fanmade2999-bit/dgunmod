@@ -249,6 +249,12 @@ void sync_remote(_PWORK* host, float dt) {
 }
 
 void hk_prg_PLY(_PWORK* pw) {
+    static bool logged_first_call = false;
+    if (!logged_first_call) {
+        NM_LOG("hk_prg_PLY EXECUTED: first call received (pw=%p)", pw);
+        logged_first_call = true;
+    }
+
     prg_fn_t orig = g_orig_prg;
     if (!orig) return;  // should be impossible once installed; never call through null
     if (pw != local_player()) { orig(pw); return; }
