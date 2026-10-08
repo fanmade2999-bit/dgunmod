@@ -137,6 +137,44 @@ jobs:
           cmake -B build -G Ninja             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-24             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
+      - name: Force extractNativeLibs=true in AndroidManifest.xml
+        run: |
+          python3 - <<'PY'
+          path = "game_out/AndroidManifest.xml"
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          if 'android:extractNativeLibs="false"' in content:
+              content = content.replace(
+                  'android:extractNativeLibs="false"',
+                  'android:extractNativeLibs="true"'
+              )
+          elif 'android:extractNativeLibs="true"' not in content:
+              if "<application " in content:
+                  content = content.replace(
+                      "<application ",
+                      '<application android:extractNativeLibs="true" ',
+                      1
+                  )
+              elif "<application>" in content:
+                  content = content.replace(
+                      "<application>",
+                      '<application android:extractNativeLibs="true">',
+                      1
+                  )
+              else:
+                  raise SystemExit("Could not find <application> tag in AndroidManifest.xml")
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+
+          if 'android:extractNativeLibs="true"' not in content:
+              raise SystemExit("Failed to set android:extractNativeLibs=true")
+
+          print("Confirmed: android:extractNativeLibs=true")
+          PY
+
       - name: Inject Shared Library & Rebuild APK
         run: |
           mkdir -p game_out/lib/arm64-v8a/
@@ -147,14 +185,7 @@ jobs:
         run: |
           zipalign -v -f 4 patched.apk patched_aligned.apk
           keytool -genkey -v -keystore test.jks -alias test -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=Test"
-          apksigner sign \
-            --ks test.jks \
-            --ks-pass pass:123456 \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --out patched_signed.apk \
-            patched_aligned.apk
+          apksigner sign             --ks test.jks             --ks-pass pass:123456             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out patched_signed.apk             patched_aligned.apk
           echo "Verifying final APK signature..."
           apksigner verify --verbose --print-certs patched_signed.apk
 
