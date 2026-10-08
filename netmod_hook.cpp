@@ -1,14 +1,18 @@
 // netmod_hook.cpp -- libnetmod.so <-> libapp_lib.so (ARM64) frame hook
 
 #include <dlfcn.h>
+#include <link.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -58,6 +62,9 @@ pw_aloc_t g_pw_aloc = nullptr;
 pw_set_pos_t g_pw_set_pos = nullptr;
 pw_free_t g_pw_free = nullptr;
 
+// Page-aligned RELRO range of libapp_lib.so (read-only after relocation).
+uintptr_t g_relro_lo = 0, g_relro_hi = 0;
+
 _PWORK* g_proxy = nullptr;
 int16_t g_proxy_type = 0;
 bool g_have_remote = false;
@@ -80,11 +87,69 @@ float wrap_pi(float a) {
     return a;
 }
 
+// ---- library layout (from the dynamic linker, not guessed) -----------------
+struct LibInfo {
+    bool found = false;
+    uintptr_t bias = 0;      // real load bias of libapp_lib.so
+    uintptr_t lo = 0, hi = 0;  // mapped range covered by PT_LOAD segments
+    uintptr_t relro_lo = 0, relro_hi = 0;
+};
+
+int phdr_cb(dl_phdr_info* info, size_t, void* data) {
+    auto* out = static_cast<LibInfo*>(data);
+    if (!info->dlpi_name || !std::strstr(info->dlpi_name, "libapp_lib.so")) return 0;
+    const long pgsz = sysconf(_SC_PAGESIZE);
+    const uintptr_t pm = pgsz > 0 ? static_cast<uintptr_t>(pgsz) - 1 : 0xfff;
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    out->bias = info->dlpi_addr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        const uintptr_t a = info->dlpi_addr + ph.p_vaddr;
+        if (ph.p_type == PT_LOAD) {
+            lo = std::min<uintptr_t>(lo, a);
+            hi = std::max<uintptr_t>(hi, a + ph.p_memsz);
+        } else if (ph.p_type == PT_GNU_RELRO) {
+            out->relro_lo = (a + pm) & ~pm;            // round start up
+            out->relro_hi = (a + ph.p_memsz) & ~pm;    // round end down
+        }
+    }
+    out->lo = lo;
+    out->hi = hi;
+    out->found = lo < hi;
+    return 1;
+}
+
+// Write one program-table slot. The table lives in RELRO (read-only at runtime),
+// so we flip the page to RW, store, then restore PROT_READ only if the whole page
+// is inside RELRO (otherwise we would break neighbouring writable globals).
+bool write_slot(prg_fn_t value) {
+    if (!g_table_slot) { NM_LOG("write_slot: no table slot"); return false; }
+    const long pgsz = sysconf(_SC_PAGESIZE);
+    if (pgsz <= 0) { NM_LOG("write_slot: bad page size %ld", pgsz); return false; }
+    const uintptr_t page = reinterpret_cast<uintptr_t>(g_table_slot) & ~static_cast<uintptr_t>(pgsz - 1);
+    NM_LOG("write_slot: slot=%p page=%p pgsz=%ld", static_cast<void*>(g_table_slot),
+           reinterpret_cast<void*>(page), pgsz);
+    if (mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(pgsz), PROT_READ | PROT_WRITE) != 0) {
+        NM_LOG("write_slot: mprotect(RW) failed errno=%d (%s)", errno, std::strerror(errno));
+        return false;
+    }
+    __atomic_store_n(reinterpret_cast<void**>(g_table_slot), reinterpret_cast<void*>(value), __ATOMIC_RELEASE);
+    if (page >= g_relro_lo && page + static_cast<uintptr_t>(pgsz) <= g_relro_hi) {
+        if (mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(pgsz), PROT_READ) != 0)
+            NM_LOG("write_slot: restore PROT_READ failed errno=%d (%s)", errno, std::strerror(errno));
+    } else {
+        NM_LOG("write_slot: page not fully inside RELRO [%p,%p) -- leaving it RW",
+               reinterpret_cast<void*>(g_relro_lo), reinterpret_cast<void*>(g_relro_hi));
+    }
+    return true;
+}
+
 // ---- proxy lifecycle -------------------------------------------------------
 // A proxy gets kind (pw+0x1a) = 24, which targets an existing no-op ret program
 // in the program table. This keeps the slot participating in normal targeting/spatial
 // caches while ensuring chr_argo does not run gameplay logic for the proxy.
 _PWORK* ensure_proxy(_PWORK* host) {
+    if (!host) return nullptr;
     if (g_proxy && F<int16_t>(g_proxy, off::kInUse) == g_proxy_type &&
         F<int8_t>(g_proxy, off::kKind) == 24)
         return g_proxy;
@@ -96,9 +161,9 @@ _PWORK* ensure_proxy(_PWORK* host) {
     if (type < 1 || type > 0x41) return nullptr;
 
     _PWORK* p = g_pw_aloc(nullptr, type, kProxyAllocFlags);
-    if (!p) { 
-        NM_LOG("pw_aloc(type %d) returned null (pool full / type not loaded)", type); 
-        return nullptr; 
+    if (!p) {
+        NM_LOG("pw_aloc(type %d) returned null (pool full / type not loaded)", type);
+        return nullptr;
     }
 
     // Kind 24 = index of existing no-op 'ret' program in 0x12c408 table
@@ -151,9 +216,11 @@ void sync_remote(_PWORK* host, float dt) {
 }
 
 void hk_prg_PLY(_PWORK* pw) {
-    if (pw != local_player()) { g_orig_prg(pw); return; }
+    prg_fn_t orig = g_orig_prg;
+    if (!orig) return;  // should be impossible once installed; never call through null
+    if (pw != local_player()) { orig(pw); return; }
 
-    g_orig_prg(pw);
+    orig(pw);
 
     const auto now = std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(now - g_last_tick).count();
@@ -171,38 +238,72 @@ void hk_prg_PLY(_PWORK* pw) {
 
     sync_remote(pw, dt);
 }
-}
+}  // namespace
 
 extern "C" bool netmod_hook_install() {
     if (g_installed.load()) return true;
+    NM_LOG("install: start");
 
     void* h = dlopen("libapp_lib.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!h) { NM_LOG("libapp_lib.so not loaded yet"); return false; }
+    NM_LOG("install: dlopen(libapp_lib.so, NOLOAD) -> %p", h);
+    if (!h) { NM_LOG("install: libapp_lib.so not loaded yet"); return false; }
 
     void* prg = dlsym(h, "_Z7prg_PLYP6_PWORK");
-    g_pwk_sym = static_cast<_PWORK**>(dlsym(h, "pwk"));
+    void* pwk = dlsym(h, "pwk");
     g_pw_aloc = reinterpret_cast<pw_aloc_t>(dlsym(h, "_Z7pw_alocP6_PWORKii"));
     g_pw_set_pos = reinterpret_cast<pw_set_pos_t>(dlsym(h, "_Z10pw_set_posP6_PWORKfffi"));
     g_pw_free = reinterpret_cast<pw_free_t>(dlsym(h, "_Z7pw_freeP6_PWORK"));
-    if (!prg || !g_pwk_sym || !g_pw_set_pos) { NM_LOG("required symbols missing"); return false; }
+    NM_LOG("install: prg_PLY=%p pwk=%p pw_aloc=%p pw_set_pos=%p pw_free=%p", prg, pwk,
+           reinterpret_cast<void*>(g_pw_aloc), reinterpret_cast<void*>(g_pw_set_pos),
+           reinterpret_cast<void*>(g_pw_free));
+    if (!prg || !pwk || !g_pw_set_pos) { NM_LOG("install: required symbols missing"); return false; }
+    if (!g_pw_aloc) NM_LOG("install: WARNING pw_aloc missing -- proxy cannot be spawned");
+    g_pwk_sym = static_cast<_PWORK**>(pwk);
 
-    g_base = reinterpret_cast<uintptr_t>(prg) - off::kLibPrgPLY;
-    g_table_slot = reinterpret_cast<prg_fn_t*>(g_base + off::kPrgTable) + off::kKindPLY;
+    // Ask the dynamic linker for the real load bias and mapped range instead of
+    // trusting a subtraction, so we never touch an address outside the library.
+    LibInfo li;
+    dl_iterate_phdr(phdr_cb, &li);
+    if (!li.found) { NM_LOG("install: dl_iterate_phdr did not find libapp_lib.so"); return false; }
+    const uintptr_t bias_from_sym = reinterpret_cast<uintptr_t>(prg) - off::kLibPrgPLY;
+    NM_LOG("install: bias(phdr)=%p bias(sym)=%p range=[%p,%p) relro=[%p,%p)",
+           reinterpret_cast<void*>(li.bias), reinterpret_cast<void*>(bias_from_sym),
+           reinterpret_cast<void*>(li.lo), reinterpret_cast<void*>(li.hi),
+           reinterpret_cast<void*>(li.relro_lo), reinterpret_cast<void*>(li.relro_hi));
+    if (bias_from_sym != li.bias) {
+        NM_LOG("install: prg_PLY offset mismatch -- different libapp_lib build, not patching");
+        return false;
+    }
+    g_base = li.bias;
+    g_relro_lo = li.relro_lo;
+    g_relro_hi = li.relro_hi;
 
-    if (*g_table_slot != reinterpret_cast<prg_fn_t>(prg)) {
-        NM_LOG("table[2]=%p != prg_PLY=%p -- wrong library build, not patching",
-               reinterpret_cast<void*>(*g_table_slot), prg);
+    const uintptr_t slot_addr = g_base + off::kPrgTable + off::kKindPLY * sizeof(void*);
+    if ((slot_addr & (sizeof(void*) - 1)) != 0 || slot_addr < li.lo || slot_addr + sizeof(void*) > li.hi) {
+        NM_LOG("install: slot %p outside mapped range [%p,%p) -- not touching it",
+               reinterpret_cast<void*>(slot_addr), reinterpret_cast<void*>(li.lo),
+               reinterpret_cast<void*>(li.hi));
+        return false;
+    }
+    g_table_slot = reinterpret_cast<prg_fn_t*>(slot_addr);
+
+    NM_LOG("install: reading table[%d] @ %p", off::kKindPLY, static_cast<void*>(g_table_slot));
+    const uintptr_t cur = *reinterpret_cast<volatile uintptr_t*>(slot_addr);
+    NM_LOG("install: table[%d]=%p prg_PLY=%p", off::kKindPLY, reinterpret_cast<void*>(cur), prg);
+    if (cur != reinterpret_cast<uintptr_t>(prg)) {
+        NM_LOG("install: table slot != prg_PLY -- wrong library build, not patching");
+        g_table_slot = nullptr;
         return false;
     }
 
-    const long pg = sysconf(_SC_PAGESIZE);
-    void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_table_slot) & ~(pg - 1));
-    if (mprotect(page, pg, PROT_READ | PROT_WRITE) != 0) { NM_LOG("mprotect failed"); return false; }
-
-    g_orig_prg = *g_table_slot;
+    g_orig_prg = reinterpret_cast<prg_fn_t>(cur);
     g_last_tick = std::chrono::steady_clock::now();
-    __atomic_store_n(reinterpret_cast<void**>(g_table_slot), reinterpret_cast<void*>(&hk_prg_PLY),
-                     __ATOMIC_RELEASE);
+    if (!write_slot(&hk_prg_PLY)) {
+        NM_LOG("install: could not write table slot; hook NOT installed");
+        g_orig_prg = nullptr;
+        g_table_slot = nullptr;
+        return false;
+    }
 
     g_installed.store(true);
     NM_LOG("hooked table[2] @ %p (base %p)", static_cast<void*>(g_table_slot),
@@ -212,8 +313,7 @@ extern "C" bool netmod_hook_install() {
 
 extern "C" void netmod_hook_uninstall() {
     if (!g_installed.exchange(false)) return;
-    __atomic_store_n(reinterpret_cast<void**>(g_table_slot), reinterpret_cast<void*>(g_orig_prg),
-                     __ATOMIC_RELEASE);
+    if (!write_slot(g_orig_prg)) NM_LOG("uninstall: could not restore table slot");
     if (slot_live(g_proxy) && g_pw_free) g_pw_free(g_proxy);
     g_proxy = nullptr;
 }
