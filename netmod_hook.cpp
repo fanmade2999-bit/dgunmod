@@ -43,6 +43,7 @@ constexpr uint16_t kTeamMask = 0x00C0;
 using prg_fn_t = void (*)(_PWORK*);
 using pw_aloc_t = _PWORK* (*)(_PWORK*, int, int);
 using pw_set_pos_t = _PWORK* (*)(_PWORK*, float, float, float, int);
+using pw_set_dir_t = void (*)(_PWORK*, float);
 using pw_free_t = void (*)(_PWORK*);
 
 #include "netmod_api.h"
@@ -60,7 +61,9 @@ prg_fn_t g_orig_prg = nullptr;
 _PWORK** g_pwk_sym = nullptr;
 pw_aloc_t g_pw_aloc = nullptr;
 pw_set_pos_t g_pw_set_pos = nullptr;
+pw_set_dir_t g_pw_set_dir = nullptr;
 pw_free_t g_pw_free = nullptr;
+std::chrono::steady_clock::time_point g_last_proxy_log;
 
 // Page-aligned RELRO range of libapp_lib.so (read-only after relocation).
 uintptr_t g_relro_lo = 0, g_relro_hi = 0;
@@ -149,16 +152,26 @@ bool write_slot(prg_fn_t value) {
 // in the program table. This keeps the slot participating in normal targeting/spatial
 // caches while ensuring chr_argo does not run gameplay logic for the proxy.
 _PWORK* ensure_proxy(_PWORK* host) {
-    if (!host) return nullptr;
+    if (!host) {
+        NM_LOG("ensure_proxy: host is null");
+        return nullptr;
+    }
     if (g_proxy && F<int16_t>(g_proxy, off::kInUse) == g_proxy_type &&
-        F<int8_t>(g_proxy, off::kKind) == 24)
+        F<int8_t>(g_proxy, off::kKind) == 24) {
         return g_proxy;
+    }
     g_proxy = nullptr;
-    if (!g_pw_aloc) return nullptr;
+    if (!g_pw_aloc) {
+        NM_LOG("ensure_proxy: pw_aloc unavailable");
+        return nullptr;
+    }
 
     int type = (kProxyTypeOverride >= 1) ? kProxyTypeOverride
                                          : static_cast<int>(F<int16_t>(host, off::kInUse));
-    if (type < 1 || type > 0x41) return nullptr;
+    if (type < 1 || type > 0x41) {
+        NM_LOG("ensure_proxy: invalid allocation type %d", type);
+        return nullptr;
+    }
 
     _PWORK* p = g_pw_aloc(nullptr, type, kProxyAllocFlags);
     if (!p) {
@@ -171,6 +184,7 @@ _PWORK* ensure_proxy(_PWORK* host) {
     g_proxy = p;
     g_proxy_type = static_cast<int16_t>(type);
     g_have_remote = false;
+    NM_LOG("proxy allocated: pw=%p type=%d kind=%d", static_cast<void*>(g_proxy), type, 24);
     return g_proxy;
 }
 
@@ -197,7 +211,14 @@ void sync_remote(_PWORK* host, float dt) {
     if (!g_have_remote) return;
 
     _PWORK* proxy = ensure_proxy(host);
-    if (!proxy || !g_pw_set_pos) return;
+    if (!proxy) {
+        NM_LOG("sync_remote: ensure_proxy failed");
+        return;
+    }
+    if (!g_pw_set_pos) {
+        NM_LOG("sync_remote: pw_set_pos unavailable");
+        return;
+    }
 
     const float dx = g_target.x - g_cur_x, dy = g_target.y - g_cur_y, dz = g_target.z - g_cur_z;
     if (std::sqrt(dx * dx + dy * dy + dz * dz) > kSnapDistance) {
@@ -210,8 +231,20 @@ void sync_remote(_PWORK* host, float dt) {
                         (1.0f - std::exp(-dt / kSmoothTauSec)));
 
     g_pw_set_pos(proxy, g_cur_x, g_cur_y, g_cur_z, kSetPosMode);
+    if (g_pw_set_dir) {
+        g_pw_set_dir(proxy, g_cur_ang);
+    } else if (uint8_t* prm = param(proxy)) {
+        *reinterpret_cast<float*>(prm + off::kParamAng) = g_cur_ang;
+    }
 
-    if (uint8_t* prm = param(proxy)) *reinterpret_cast<float*>(prm + off::kParamAng) = g_cur_ang;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_last_proxy_log.time_since_epoch().count() == 0 ||
+        std::chrono::duration<float>(now - g_last_proxy_log).count() >= 1.0f) {
+        g_last_proxy_log = now;
+        NM_LOG("proxy update: pw=%p x=%.1f y=%.1f z=%.1f angle=%.1f seq=%u dir=%s",
+               static_cast<void*>(proxy), g_cur_x, g_cur_y, g_cur_z, g_cur_ang,
+               g_target.seq, g_pw_set_dir ? "pw_set_dir" : "param_angle");
+    }
     apply_team_flags(proxy, host);
 }
 
@@ -252,12 +285,14 @@ extern "C" bool netmod_hook_install() {
     void* pwk = dlsym(h, "pwk");
     g_pw_aloc = reinterpret_cast<pw_aloc_t>(dlsym(h, "_Z7pw_alocP6_PWORKii"));
     g_pw_set_pos = reinterpret_cast<pw_set_pos_t>(dlsym(h, "_Z10pw_set_posP6_PWORKfffi"));
+    g_pw_set_dir = reinterpret_cast<pw_set_dir_t>(dlsym(h, "_Z10pw_set_dirP6_PWORKf"));
     g_pw_free = reinterpret_cast<pw_free_t>(dlsym(h, "_Z7pw_freeP6_PWORK"));
-    NM_LOG("install: prg_PLY=%p pwk=%p pw_aloc=%p pw_set_pos=%p pw_free=%p", prg, pwk,
+    NM_LOG("install: prg_PLY=%p pwk=%p pw_aloc=%p pw_set_pos=%p pw_set_dir=%p pw_free=%p", prg, pwk,
            reinterpret_cast<void*>(g_pw_aloc), reinterpret_cast<void*>(g_pw_set_pos),
-           reinterpret_cast<void*>(g_pw_free));
+           reinterpret_cast<void*>(g_pw_set_dir), reinterpret_cast<void*>(g_pw_free));
     if (!prg || !pwk || !g_pw_set_pos) { NM_LOG("install: required symbols missing"); return false; }
     if (!g_pw_aloc) NM_LOG("install: WARNING pw_aloc missing -- proxy cannot be spawned");
+    if (!g_pw_set_dir) NM_LOG("install: WARNING pw_set_dir missing -- falling back to direct param angle write");
     g_pwk_sym = static_cast<_PWORK**>(pwk);
 
     // Ask the dynamic linker for the real load bias and mapped range instead of
