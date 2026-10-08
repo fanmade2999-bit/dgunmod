@@ -53,7 +53,6 @@ jobs:
         run: |
           python3 - <<'PY2'
           import os
-          import re
 
           target_file = None
 
@@ -73,49 +72,76 @@ jobs:
           print(f"Targeting game entry class: {target_file}")
 
           with open(target_file, "r", encoding="utf-8") as f:
-              content = f.read()
+              lines = f.readlines()
 
-          if 'const-string v0, "netmod"' in content:
+          # Find DGuns5 static initializer.
+          clinit_start = None
+          clinit_end = None
+
+          for i, line in enumerate(lines):
+              if ".method" in line and "<clinit>()V" in line:
+                  clinit_start = i
+                  for j in range(i + 1, len(lines)):
+                      if lines[j].strip() == ".end method":
+                          clinit_end = j
+                          break
+                  break
+
+          if clinit_start is None or clinit_end is None:
+              raise ValueError(
+                  "Failed to locate DGuns5 <clinit>()V static initializer!"
+              )
+
+          # Find app_lib string inside <clinit>.
+          app_lib_line = None
+
+          for i in range(clinit_start, clinit_end):
+              if 'const-string v0, "app_lib"' in lines[i]:
+                  app_lib_line = i
+                  break
+
+          if app_lib_line is None:
+              raise ValueError(
+                  "Failed to locate const-string v0, \"app_lib\" inside DGuns5 <clinit>!"
+              )
+
+          # Find the following loadLibrary instruction.
+          load_line = None
+
+          for i in range(app_lib_line + 1, min(app_lib_line + 15, clinit_end)):
+              if "Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V" in lines[i]:
+                  load_line = i
+                  break
+
+          if load_line is None:
+              raise ValueError(
+                  "Found app_lib but failed to locate its following loadLibrary instruction!"
+              )
+
+          # Prevent duplicate injection.
+          if any(
+              'const-string v0, "netmod"' in lines[i]
+              for i in range(clinit_start, clinit_end)
+          ):
               print('netmod loader already present; leaving file unchanged.')
           else:
-              pattern = (
-                  r'(const-string\s+v0,\s*"app_lib"\s*'
-                  r'invoke-static\s+\{v0\},\s*'
-                  r'Ljava/lang/System;->loadLibrary\(Ljava/lang/String;\)V)'
-              )
+              injection = [
+                  '    const-string v0, "netmod"\n',
+                  '    invoke-static {v0}, '
+                  'Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+              ]
 
-              match = re.search(pattern, content)
-
-              if not match:
-                  raise ValueError(
-                      "Failed to locate app_lib load sequence inside DGuns5.smali!"
-                  )
-
-              original = match.group(1)
-
-              injection = (
-                  original
-                  + '\n'
-                  + '    const-string v0, "netmod"\n'
-                  + '    invoke-static {v0}, '
-                  + 'Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V'
-              )
-
-              new_content = (
-                  content[:match.start()]
-                  + injection
-                  + content[match.end():]
-              )
+              lines[load_line + 1:load_line + 1] = injection
 
               with open(target_file, "w", encoding="utf-8") as f:
-                  f.write(new_content)
+                  f.writelines(lines)
 
               print(
                   'Successfully injected loadLibrary("netmod") '
-                  "directly after app_lib load."
+                  "immediately after app_lib load."
               )
 
-          print("Verified: DGuns5.smali contains the netmod loader.")
+          print("Verified: DGuns5.smali netmod loader handling complete.")
           PY2
 
       - name: Build Native Library (libnetmod.so)
