@@ -24,8 +24,8 @@
 struct _PWORK;
 
 namespace off {
-constexpr uintptr_t kLibPrgPLY = 0xc7c24;
-constexpr uintptr_t kPrgTable = 0x12c408;
+constexpr uintptr_t kLibPrgPLY = 0xbda9c;
+constexpr uintptr_t kPrgTable = 0x12bbf8;
 constexpr int       kKindPLY = 2;
 
 constexpr uintptr_t kInUse = 0x00;
