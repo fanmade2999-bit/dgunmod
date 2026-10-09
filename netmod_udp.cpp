@@ -1,6 +1,8 @@
 // netmod_udp.cpp -- non-blocking-ish UDP transport for netmod.
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -45,10 +47,12 @@ std::atomic<int> g_fd{-1};
 std::atomic<bool> g_running{false};
 std::thread g_rx;
 sockaddr_in g_peer{};
+bool g_peer_explicit = false;
 std::mutex g_peer_mx;
 uint32_t g_self_id = 0;
 uint32_t g_tx_seq = 0;
 std::chrono::steady_clock::time_point g_last_tx{};
+uint32_t g_tx_log_count = 0;
 
 std::mutex g_rx_mx;
 RemoteTransform g_rx_latest{};
@@ -107,6 +111,8 @@ extern "C" void netmod_set_peer(const char* ip) {
     if (!ip || inet_pton(AF_INET, ip, &a) != 1) { NM_LOG("bad peer address"); return; }
     std::lock_guard<std::mutex> lk(g_peer_mx);
     g_peer.sin_addr = a;
+    g_peer_explicit = true;
+    NM_LOG("peer set to %s:%u", ip, kPort);
 }
 
 extern "C" void netmod_net_start() {
@@ -141,7 +147,7 @@ extern "C" void netmod_net_start() {
         g_peer = {};
         g_peer.sin_family = AF_INET;
         g_peer.sin_port = htons(kPort);
-        inet_pton(AF_INET, "192.168.43.255", &g_peer.sin_addr);
+        g_peer_explicit = false;
     }
 
     g_fd.store(fd);
@@ -173,10 +179,43 @@ extern "C" void netmod_update_local_transform(float x, float y, float z, float a
     p.seq = ++g_tx_seq;
     p.x = x; p.y = y; p.z = z; p.angle = angle;
 
-    sockaddr_in dst;
-    { std::lock_guard<std::mutex> lk(g_peer_mx); dst = g_peer; }
-    sendto(fd, &p, sizeof(p), MSG_DONTWAIT,
-           reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    bool explicit_peer = false;
+    sockaddr_in dst{};
+    {
+        std::lock_guard<std::mutex> lk(g_peer_mx);
+        explicit_peer = g_peer_explicit;
+        dst = g_peer;
+    }
+
+    int sent = 0;
+    if (explicit_peer) {
+        const ssize_t n = sendto(fd, &p, sizeof(p), MSG_DONTWAIT,
+                                 reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        if (n == static_cast<ssize_t>(sizeof(p))) sent = 1;
+    } else {
+        // Do not assume a specific Android hotspot subnet (for example 192.168.43.x).
+        // Broadcast to each active IPv4 interface that exposes a broadcast address.
+        ifaddrs* ifs = nullptr;
+        if (getifaddrs(&ifs) == 0) {
+            for (ifaddrs* it = ifs; it; it = it->ifa_next) {
+                if (!it->ifa_addr || !it->ifa_broadaddr ||
+                    it->ifa_addr->sa_family != AF_INET ||
+                    !(it->ifa_flags & IFF_UP) || !(it->ifa_flags & IFF_BROADCAST) ||
+                    (it->ifa_flags & IFF_LOOPBACK)) continue;
+                sockaddr_in broadcast = *reinterpret_cast<sockaddr_in*>(it->ifa_broadaddr);
+                broadcast.sin_port = htons(kPort);
+                const ssize_t n = sendto(fd, &p, sizeof(p), MSG_DONTWAIT,
+                                         reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
+                if (n == static_cast<ssize_t>(sizeof(p))) ++sent;
+            }
+            freeifaddrs(ifs);
+        } else {
+            NM_LOG("getifaddrs failed; cannot discover local broadcast interfaces");
+        }
+    }
+    if ((++g_tx_log_count % 60u) == 1u)
+        NM_LOG("UDP tx: seq=%u sent_on=%d route=%s", p.seq, sent,
+               explicit_peer ? "unicast" : "interface-broadcast");
 }
 
 extern "C" bool netmod_get_remote_transform(RemoteTransform* out) {
