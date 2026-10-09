@@ -68,13 +68,13 @@ bool write_slot(prg_fn_t v){
 }
 _PWORK* ensure_proxy(_PWORK* host){
  if(!host){NM_LOG("ensure_proxy: host is null");return nullptr;}
- if(g_proxy&&F<int16_t>(g_proxy,off::kInUse)==g_proxy_type&&F<int8_t>(g_proxy,off::kKind)==kProxyKind)return g_proxy;
+ if(g_proxy&&F<int16_t>(g_proxy,off::kInUse)==g_proxy_type&&F<int8_t>(g_proxy,off::kKind)==off::kProxyKind)return g_proxy;
  g_proxy=nullptr;if(!g_pw_aloc){NM_LOG("ensure_proxy: pw_aloc unavailable");return nullptr;}
  int type=(kProxyTypeOverride>=1)?kProxyTypeOverride:static_cast<int>(F<int16_t>(host,off::kInUse));
  if(type<1||type>0x41){NM_LOG("ensure_proxy: invalid allocation type %d",type);return nullptr;}
  _PWORK* p=g_pw_aloc(nullptr,type,kProxyAllocFlags);if(!p){NM_LOG("pw_aloc(type %d) returned null (pool full / type not loaded)",type);return nullptr;}
- F<int8_t>(p,off::kKind)=static_cast<int8_t>(kProxyKind);g_proxy=p;g_proxy_type=static_cast<int16_t>(type);g_have_remote=false;
- NM_LOG("proxy allocated: pw=%p type=%d kind=%d",static_cast<void*>(g_proxy),type,kProxyKind);
+ F<int8_t>(p,off::kKind)=static_cast<int8_t>(off::kProxyKind);g_proxy=p;g_proxy_type=static_cast<int16_t>(type);g_have_remote=false;
+ NM_LOG("proxy allocated: pw=%p type=%d kind=%d",static_cast<void*>(g_proxy),type,off::kProxyKind);
  NM_LOG("PWORK compare: host=%p inUse=%d flags=0x%04x body=%p param=%p kind=%d | proxy=%p inUse=%d flags=0x%04x body=%p param=%p kind=%d",
   static_cast<void*>(host),static_cast<int>(F<int16_t>(host,off::kInUse)),static_cast<unsigned>(F<uint16_t>(host,off::kFlags)),
   static_cast<void*>(body(host)),static_cast<void*>(param(host)),static_cast<int>(F<int8_t>(host,off::kKind)),
@@ -102,7 +102,7 @@ void sync_remote(_PWORK* host,float dt){
  else{const float a=1.0f-std::exp(-dt/kSmoothTauSec);g_cur_x+=dx*a;g_cur_y+=dy*a;g_cur_z+=dz*a;}
  g_cur_ang=wrap_pi(g_cur_ang+wrap_pi(g_target.angle-g_cur_ang)*(1.0f-std::exp(-dt/kSmoothTauSec)));
  g_pw_set_pos(p,g_cur_x,g_cur_y,g_cur_z,kSetPosMode);if(g_pw_set_dir)g_pw_set_dir(p,g_cur_ang);else if(uint8_t* prm=param(p))*reinterpret_cast<float*>(prm+off::kParamAng)=g_cur_ang;
- const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,kProxyKind);}
+ const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,off::kProxyKind);}
  apply_team_flags(p,host);
 }
 void hk_prg_PLY(_PWORK* pw){
