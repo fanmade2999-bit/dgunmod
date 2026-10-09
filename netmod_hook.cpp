@@ -46,6 +46,16 @@ template<class T> inline T& F(_PWORK* p,uintptr_t o){return *reinterpret_cast<T*
 inline uint8_t* body(_PWORK* p){return F<uint8_t*>(p,off::kBody);}
 inline uint8_t* param(_PWORK* p){return F<uint8_t*>(p,off::kParam);}
 inline bool slot_live(_PWORK* p){return p&&F<int16_t>(p,off::kInUse)>=1;}
+void log_anim_state(const char* tag,_PWORK* w){
+ if(!w){NM_LOG("%s anim: PWORK=null",tag);return;}
+ uint8_t* d=param(w);if(!d){NM_LOG("%s anim: pdisp=null",tag);return;}
+ void* model=*reinterpret_cast<void**>(d+0x28);
+ int model_count=model?static_cast<int>(*reinterpret_cast<int16_t*>(static_cast<uint8_t*>(model)+0x06)):-1;
+ void* panm=*reinterpret_cast<void**>(d+0x30);
+ if(!panm){NM_LOG("%s anim: model=%p model_count=%d panm0=null",tag,model,model_count);return;}
+ auto* a=static_cast<uint8_t*>(panm);
+ NM_LOG("%s anim: model=%p model_count=%d panm0=%p flags=0x%04x requested=%d current=%d key=%d phase=%.3f clip=%p",tag,model,model_count,panm,static_cast<unsigned>(*reinterpret_cast<uint16_t*>(a+0x02)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x04)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x06)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x08)),*reinterpret_cast<float*>(a+0x14),*reinterpret_cast<void**>(a+0x28));
+}
 inline _PWORK* local_player(){return g_pwk_sym?*g_pwk_sym:nullptr;}
 float wrap_pi(float a){const float pi=3.14159265358979f;while(a>pi)a-=2*pi;while(a<-pi)a+=2*pi;return a;}
 struct LibInfo{bool found=false;uintptr_t bias=0,lo=0,hi=0,relro_lo=0,relro_hi=0;};
@@ -102,7 +112,7 @@ void sync_remote(_PWORK* host,float dt){
  else{const float a=1.0f-std::exp(-dt/kSmoothTauSec);g_cur_x+=dx*a;g_cur_y+=dy*a;g_cur_z+=dz*a;}
  g_cur_ang=wrap_pi(g_cur_ang+wrap_pi(g_target.angle-g_cur_ang)*(1.0f-std::exp(-dt/kSmoothTauSec)));
  g_pw_set_pos(p,g_cur_x,g_cur_y,g_cur_z,kSetPosMode);if(g_pw_set_dir)g_pw_set_dir(p,g_cur_ang);else if(uint8_t* prm=param(p))*reinterpret_cast<float*>(prm+off::kParamAng)=g_cur_ang;
- const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,off::kProxyKind);}
+ const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,off::kProxyKind);log_anim_state("host",host);log_anim_state("proxy",p);}
  apply_team_flags(p,host);
 }
 void hk_prg_PLY(_PWORK* pw){
