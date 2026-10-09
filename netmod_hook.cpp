@@ -56,6 +56,24 @@ void log_anim_state(const char* tag,_PWORK* w){
  auto* a=static_cast<uint8_t*>(panm);
  NM_LOG("%s anim: model=%p model_count=%d panm0=%p flags=0x%04x requested=%d current=%d key=%d phase=%.3f clip=%p",tag,model,model_count,panm,static_cast<unsigned>(*reinterpret_cast<uint16_t*>(a+0x02)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x04)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x06)),static_cast<int>(*reinterpret_cast<int16_t*>(a+0x08)),*reinterpret_cast<float*>(a+0x14),*reinterpret_cast<void**>(a+0x28));
 }
+void mirror_requested_animation(_PWORK* host,_PWORK* proxy){
+ if(!host||!proxy)return;
+ uint8_t* hd=param(host);uint8_t* pd=param(proxy);
+ if(!hd||!pd)return;
+ void* hm=*reinterpret_cast<void**>(hd+0x28);
+ void* pm=*reinterpret_cast<void**>(pd+0x28);
+ if(!hm||hm!=pm)return;
+ const int count=static_cast<int>(*reinterpret_cast<int16_t*>(static_cast<uint8_t*>(hm)+0x06));
+ if(count<=0||count>256)return;
+ auto* ha=static_cast<uint8_t*>(*reinterpret_cast<void**>(hd+0x30));
+ auto* pa=static_cast<uint8_t*>(*reinterpret_cast<void**>(pd+0x30));
+ if(!ha||!pa)return;
+ const int requested=static_cast<int>(*reinterpret_cast<int16_t*>(ha+0x04));
+ const int previous=static_cast<int>(*reinterpret_cast<int16_t*>(pa+0x04));
+ if(requested<0||requested>=count||requested==previous)return;
+ *reinterpret_cast<int16_t*>(pa+0x04)=static_cast<int16_t>(requested);
+ NM_LOG("anim mirror: host requested=%d proxy requested %d -> %d model_count=%d",requested,previous,requested,count);
+}
 inline _PWORK* local_player(){return g_pwk_sym?*g_pwk_sym:nullptr;}
 float wrap_pi(float a){const float pi=3.14159265358979f;while(a>pi)a-=2*pi;while(a<-pi)a+=2*pi;return a;}
 struct LibInfo{bool found=false;uintptr_t bias=0,lo=0,hi=0,relro_lo=0,relro_hi=0;};
@@ -112,6 +130,7 @@ void sync_remote(_PWORK* host,float dt){
  else{const float a=1.0f-std::exp(-dt/kSmoothTauSec);g_cur_x+=dx*a;g_cur_y+=dy*a;g_cur_z+=dz*a;}
  g_cur_ang=wrap_pi(g_cur_ang+wrap_pi(g_target.angle-g_cur_ang)*(1.0f-std::exp(-dt/kSmoothTauSec)));
  g_pw_set_pos(p,g_cur_x,g_cur_y,g_cur_z,kSetPosMode);if(g_pw_set_dir)g_pw_set_dir(p,g_cur_ang);else if(uint8_t* prm=param(p))*reinterpret_cast<float*>(prm+off::kParamAng)=g_cur_ang;
+ mirror_requested_animation(host,p);
  const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,off::kProxyKind);log_anim_state("host",host);log_anim_state("proxy",p);}
  apply_team_flags(p,host);
 }
