@@ -128,10 +128,24 @@ void sync_remote(_PWORK* host,float dt){
  if(g_cur_x==0.0f&&g_cur_y==0.0f&&g_cur_z==0.0f){g_cur_x=want_x;g_cur_y=want_y;g_cur_z=want_z;}
  const float dx=want_x-g_cur_x,dy=want_y-g_cur_y,dz=want_z-g_cur_z;if(std::sqrt(dx*dx+dy*dy+dz*dz)>kSnapDistance){g_cur_x=want_x;g_cur_y=want_y;g_cur_z=want_z;}
  else{const float a=1.0f-std::exp(-dt/kSmoothTauSec);g_cur_x+=dx*a;g_cur_y+=dy*a;g_cur_z+=dz*a;}
- g_cur_ang=wrap_pi(g_cur_ang+wrap_pi(g_target.angle-g_cur_ang)*(1.0f-std::exp(-dt/kSmoothTauSec)));
- g_pw_set_pos(p,g_cur_x,g_cur_y,g_cur_z,kSetPosMode);if(g_pw_set_dir)g_pw_set_dir(p,g_cur_ang);else if(uint8_t* prm=param(p))*reinterpret_cast<float*>(prm+off::kParamAng)=g_cur_ang;
+ // Combined local diagnostic: keep the proxy near the player and mirror the player's live facing angle.
+ // The test sender currently supplies a fixed angle, so its packet angle cannot validate turning.
+ uint8_t* host_param=param(host);
+ const float host_ang=host_param?*reinterpret_cast<float*>(host_param+off::kParamAng):g_target.angle;
+ g_cur_ang=wrap_pi(host_ang);
+ g_pw_set_pos(p,g_cur_x,g_cur_y,g_cur_z,kSetPosMode);
+ if(g_pw_set_dir)g_pw_set_dir(p,g_cur_ang);
+ else if(uint8_t* prm=param(p))*reinterpret_cast<float*>(prm+off::kParamAng)=g_cur_ang;
  mirror_requested_animation(host,p);
- const auto now=std::chrono::steady_clock::now();if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){g_last_proxy_log=now;NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) angle=%.2f seq=%u kind=%d",static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,g_cur_ang,g_target.seq,off::kProxyKind);log_anim_state("host",host);log_anim_state("proxy",p);}
+ const auto now=std::chrono::steady_clock::now();
+ if(g_last_proxy_log.time_since_epoch().count()==0||std::chrono::duration<float>(now-g_last_proxy_log).count()>=1.0f){
+  g_last_proxy_log=now;
+  const float proxy_ang=param(p)?*reinterpret_cast<float*>(param(p)+off::kParamAng):0.0f;
+  NM_LOG("proxy update: pw=%p host=(%.1f,%.1f,%.1f) offset=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) host_angle=%.3f packet_angle=%.3f applied_angle=%.3f proxy_angle=%.3f seq=%u kind=%d",
+   static_cast<void*>(p),*reinterpret_cast<float*>(host_body+off::kBodyX),*reinterpret_cast<float*>(host_body+off::kBodyY),*reinterpret_cast<float*>(host_body+off::kBodyZ),
+   g_target.x,g_target.y,g_target.z,want_x,want_y,want_z,host_ang,g_target.angle,g_cur_ang,proxy_ang,g_target.seq,off::kProxyKind);
+  log_anim_state("host",host);log_anim_state("proxy",p);
+ }
  apply_team_flags(p,host);
 }
 void hk_prg_PLY(_PWORK* pw){
